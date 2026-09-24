@@ -196,11 +196,30 @@ Example Video:
 
 - See #19164
 
+### n-gram Hint (`ngram-hint`)
+
+The other n-gram implementations draft from what the model has already produced. `ngram-hint` drafts from token sequences supplied for the request before generation starts.
+
+`llama-server` supplies one sequence per tool of a chat request: the call to that tool as the chat template renders it, with placeholder argument values. The prompt carries the tool schema, but the model emits the call syntax of its template (`<tool_call>{"name": ...` and so on), which appears nowhere in the prompt, so a history-based drafter has nothing to match at the first call. The hint matches at the generation prompt and the structural tokens of the call are drafted, while the argument values are still decoded by the model.
+
+The drafter looks for the last `size_n` tokens of the context (default 3) in each hint and proposes what follows there, up to `size_m` tokens (default 16). A hint is matched on a single token only at its first token. Hints are cleared at the start of every generation, and the drafter does nothing for a request that carries none.
+
+```bash
+llama-server [...] --jinja --spec-type ngram-hint
+```
+
+It can be combined with another implementation for the rest of the answer, the hints are tried first:
+
+```bash
+llama-server [...] --jinja --spec-type ngram-hint,ngram-map-k
+```
+
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
 - ngram-map-k looks for a previous matching n-gram and inserts the following m-gram but uses an internal hash-map of n-grams in the current context window.
 - ngram-mod uses a hash pool which is shared across all server slots. The hash pool is a map from n-gram hash to the next token (not the next m-gram as in ngram-map).
+- ngram-hint does not look at the history at all; it drafts from sequences supplied for the request, such as the tool calls the chat template renders.
 
 ## Command-Line Options
 
@@ -224,7 +243,7 @@ Use exactly one of these options:
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|ngram-hint]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -372,6 +391,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 | `ngram-map-k4v` | Use n-gram pattern matching with n-gram-keys and up to four m-gram values (experimental) |
 | `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
+| `ngram-hint` | Use token sequences supplied per request, such as the tool calls rendered by the chat template |
 
 **Example:** Server-instance used to refactor source code.
 ```bash
