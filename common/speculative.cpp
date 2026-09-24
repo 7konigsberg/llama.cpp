@@ -41,7 +41,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-hint",    COMMON_SPECULATIVE_TYPE_NGRAM_HINT}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -164,6 +165,9 @@ struct common_speculative_impl {
     virtual ~common_speculative_impl() = default;
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
+
+    // (optional) supply a token sequence for the current generation
+    virtual void hint(llama_seq_id /*seq_id*/, const llama_tokens & /*tokens*/) {}
 
     virtual bool process(const llama_batch & batch) = 0;
 
@@ -1812,6 +1816,118 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     }
 };
 
+// find the most recent tokens of the context inside one of the hints and draft
+// what the hint says follows them. mirrors common_ngram_simple_draft.
+static void common_ngram_hint_draft(
+        const common_params_speculative_ngram_hint & params,
+        const std::vector<llama_tokens> & hints,
+        const llama_tokens & inp,
+        llama_token sampled,
+        int32_t n_max,
+        llama_tokens & result) {
+    result.clear();
+
+    if (hints.empty()) {
+        return;
+    }
+
+    int32_t n_draft = params.size_m;
+    if (n_max >= 0) {
+        n_draft = std::min(n_draft, n_max);
+    }
+    if (n_draft <= 0) {
+        return;
+    }
+
+    // the key is the size_n most recent tokens: the tail of inp, then sampled
+    llama_tokens key;
+    const size_t n_key = std::min((size_t) params.size_n, inp.size() + 1);
+    key.reserve(n_key);
+    for (size_t i = inp.size() + 1 - n_key; i < inp.size(); ++i) {
+        key.push_back(inp[i]);
+    }
+    key.push_back(sampled);
+
+    // longest key first. a key of one token matches only at the start of a hint,
+    // so a common token cannot enter a hint spuriously
+    for (size_t n = key.size(); n >= 1; --n) {
+        const llama_token * k = key.data() + (key.size() - n);
+
+        for (const auto & hint : hints) {
+            if (hint.size() <= n) {
+                continue;
+            }
+
+            // stop short of the end of the hint: a match there has nothing following it
+            const size_t i_end = (n == 1) ? 1 : hint.size() - n;
+
+            for (size_t i = 0; i < i_end; ++i) {
+                if (std::memcmp(hint.data() + i, k, n*sizeof(llama_token)) != 0) {
+                    continue;
+                }
+
+                const size_t i_next = i + n;
+                const size_t n_take = std::min((size_t) n_draft, hint.size() - i_next);
+
+                result.assign(hint.begin() + i_next, hint.begin() + i_next + n_take);
+                return;
+            }
+        }
+    }
+}
+
+// self-speculation from token sequences supplied for the current request,
+// e.g. the tool-call syntax the chat template renders (common_chat_templates_render_tool_calls)
+struct common_speculative_impl_ngram_hint : public common_speculative_impl {
+    common_params_speculative_ngram_hint params;
+
+    // per sequence: the supplied token sequences, cleared at begin()
+    std::vector<std::vector<llama_tokens>> hints;
+
+    common_speculative_impl_ngram_hint(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_HINT, n_seq, params.ngram_hint.size_m)
+        , params(params.ngram_hint)
+        , hints(n_seq)
+    {
+        SPC_TRC("%s", "adding speculative implementation 'ngram-hint'\n");
+        SPC_TRC("- size_n=%d, size_m=%d\n", this->params.size_n, this->params.size_m);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        hints[seq_id].clear();
+    }
+
+    void hint(llama_seq_id seq_id, const llama_tokens & tokens) override {
+        if (tokens.empty()) {
+            return;
+        }
+
+        hints[seq_id].push_back(tokens);
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        // no batch state: the hints are supplied, not learnt
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            common_ngram_hint_draft(params, hints[seq_id], *dp.prompt, dp.id_last, dp.n_max, *dp.result);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop: the hints are exact, there is nothing to learn
+    }
+};
+
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // n_seq configs
     std::vector<common_ngram_map> config;
@@ -2256,6 +2372,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_HINT:    return "ngram-hint";
         default:                                    return "unknown";
     }
 }
@@ -2358,6 +2475,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_HINT:
+                n_max = std::max(n_max, (int32_t) spec->ngram_hint.size_m);
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2629,10 +2749,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_HINT);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -2716,6 +2837,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
                 break;
             }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_HINT: {
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_hint>(config.params, n_seq));
+                break;
+            }
             default:
                 break;
         }
@@ -2787,6 +2912,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_hint(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & tokens) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->hint(seq_id, tokens);
     }
 }
 
