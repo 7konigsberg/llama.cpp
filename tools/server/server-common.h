@@ -319,6 +319,7 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    bool render_tool_calls = false; // render each tool's call syntax (used by the ngram-hint drafter)
 };
 
 // used by /completions endpoint

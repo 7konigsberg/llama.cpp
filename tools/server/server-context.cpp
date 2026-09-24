@@ -1470,6 +1470,10 @@ private:
                 return false;
             }
 
+            const bool spec_ngram_hint = std::find(params_base.speculative.types.begin(),
+                                                   params_base.speculative.types.end(),
+                                                   COMMON_SPECULATIVE_TYPE_NGRAM_HINT) != params_base.speculative.types.end();
+
             // IMPORTANT: chat_params is reused across sleeping / resuming states,
             //            never store llama_context/llama_model pointers in chat_params,
             //            as they may be invalidated after sleeping
@@ -1486,7 +1490,8 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* render_tool_calls     */ spec_ngram_hint
             };
 
             {
@@ -3838,6 +3843,10 @@ private:
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+
+                    for (const auto & hint : slot.task->params.spec_hints) {
+                        common_speculative_hint(spec.get(), slot.id, hint);
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;

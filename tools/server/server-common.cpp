@@ -1363,6 +1363,10 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    if (opt.render_tool_calls && !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        // the tool-call syntax the model is about to emit, for the ngram-hint drafter
+        llama_params["spec_hints"] = common_chat_templates_render_tool_calls(opt.tmpls.get(), inputs);
+    }
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");

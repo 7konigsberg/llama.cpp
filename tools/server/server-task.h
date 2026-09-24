@@ -78,6 +78,8 @@ struct task_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    std::vector<llama_tokens> spec_hints; // token sequences the ngram-hint drafter may propose from
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

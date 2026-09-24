@@ -324,6 +324,23 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
         }));
 
+    add((new field_json("spec_hints"))
+        ->set_desc("Token sequences the ngram-hint speculative decoding type may draft from, set internally by the server from the chat template's rendered tool calls")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.spec_hints.clear();
+            for (const auto & hint : data.at("spec_hints")) {
+                if (!hint.is_string() || hint.empty()) {
+                    continue;
+                }
+                // parse_special so control tokens become single ids, no BOS mid-conversation
+                auto ids = common_tokenize(ctx.vocab, hint.get<std::string>(), false, true);
+                if (!ids.empty()) {
+                    ctx.params.spec_hints.push_back(std::move(ids));
+                }
+            }
+        }));
+
     add((new field_json("continue_final_message"))
         ->set_desc("Whether to continue the final message of the chat template")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
