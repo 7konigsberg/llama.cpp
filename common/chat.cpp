@@ -1222,14 +1222,18 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     return std::nullopt;
 }
 
-static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
-                                                            const struct common_chat_templates_inputs & inputs) {
+// the template to render with: the tool-use variant when the request carries tools
+static const common_chat_template & common_chat_templates_select(const struct common_chat_templates * tmpls, bool has_tools) {
+    return has_tools && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
+}
+
+// the inputs as the template renders them, with the per-template workarounds applied
+static autoparser::generation_params common_chat_templates_generation_params(const struct common_chat_templates *        tmpls,
+                                                                            const common_chat_template &                tmpl,
+                                                                            const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
-    const auto & tmpl =
-        params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
     const auto & src             = tmpl.source();
-    const auto & caps            = tmpl.original_caps();
     std::vector<common_chat_msg>        trimmed_messages;
     const std::vector<common_chat_msg> * messages_to_render = &inputs.messages;
     if (src.find("You have access to the following functions in JSONSchema format") != std::string::npos) {
@@ -1300,6 +1304,17 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     params.parallel_tool_calls = inputs.parallel_tool_calls;
+
+    return params;
+}
+
+static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
+                                                            const struct common_chat_templates_inputs & inputs) {
+    const auto & tmpl = common_chat_templates_select(tmpls, !inputs.tools.empty());
+    const auto & src  = tmpl.source();
+    const auto & caps = tmpl.original_caps();
+
+    autoparser::generation_params params = common_chat_templates_generation_params(tmpls, tmpl, inputs);
 
     if (params.tools.is_array()) {
         if (params.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && !params.grammar.empty()) {
@@ -1436,6 +1451,92 @@ common_chat_params common_chat_templates_apply(const struct common_chat_template
     GGML_ASSERT(tmpls != nullptr);
     return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
                               common_chat_templates_apply_legacy(tmpls, inputs);
+}
+
+// a placeholder value of the type the parameter schema declares
+static json common_chat_tool_param_placeholder(const json & schema) {
+    const std::string type = schema.is_object() ? schema.value("type", "string") : "string";
+
+    if (type == "integer" || type == "number") {
+        return 0;
+    }
+    if (type == "boolean") {
+        return true;
+    }
+    if (type == "array") {
+        return json::array();
+    }
+    if (type == "object") {
+        return json::object();
+    }
+
+    return "X";
+}
+
+std::vector<std::string> common_chat_templates_render_tool_calls(const struct common_chat_templates *        tmpls,
+                                                                 const struct common_chat_templates_inputs & inputs) {
+    std::vector<std::string> result;
+
+    if (inputs.tools.empty() || !inputs.use_jinja) {
+        return result;
+    }
+
+    // one direct render of the conversation and one per tool; no parser is generated
+    const auto & tmpl = common_chat_templates_select(tmpls, true);
+    if (!tmpl.original_caps().supports_tool_calls) {
+        return result;
+    }
+
+    // the conversation as rendered, with nothing after it
+    common_chat_templates_inputs base = inputs;
+    base.add_generation_prompt   = false;
+    base.continue_final_message  = COMMON_CHAT_CONTINUATION_NONE;
+
+    std::string without;
+    try {
+        without = common_chat_template_direct_apply(tmpl, common_chat_templates_generation_params(tmpls, tmpl, base));
+    } catch (const std::exception & e) {
+        LOG_DBG("%s: cannot render the conversation: %s\n", __func__, e.what());
+        return result;
+    }
+
+    for (const auto & tool : inputs.tools) {
+        json arguments = json::object();
+        try {
+            const json parameters = json::parse(tool.parameters);
+            if (parameters.contains("properties") && parameters.at("properties").is_object()) {
+                for (const auto & it : parameters.at("properties").items()) {
+                    arguments[it.key()] = common_chat_tool_param_placeholder(it.value());
+                }
+            }
+        } catch (const std::exception &) {
+            // not a schema: render a call without arguments
+        }
+
+        common_chat_msg call;
+        call.role = "assistant";
+        call.tool_calls.push_back({ tool.name, arguments.dump(), "" });
+
+        common_chat_templates_inputs with = base;
+        with.messages.push_back(call);
+
+        std::string rendered;
+        try {
+            rendered = common_chat_template_direct_apply(tmpl, common_chat_templates_generation_params(tmpls, tmpl, with));
+        } catch (const std::exception & e) {
+            LOG_DBG("%s: cannot render a call to '%s': %s\n", __func__, tool.name.c_str(), e.what());
+            continue;
+        }
+
+        if (rendered.compare(0, without.size(), without) != 0) {
+            LOG_DBG("%s: the call to '%s' does not extend the conversation\n", __func__, tool.name.c_str());
+            continue;
+        }
+
+        result.push_back(rendered.substr(without.size()));
+    }
+
+    return result;
 }
 
 common_chat_msg common_chat_parse(const std::string &               input,

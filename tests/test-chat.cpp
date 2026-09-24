@@ -2117,6 +2117,58 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
 
 }
 
+static void test_render_tool_calls() {
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What time is it in Paris?";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = { user };
+    inputs.tools    = { special_function_tool, get_time_tool, empty_args_tool };
+
+    const std::vector<std::string> paths = {
+        "models/templates/NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use.jinja",
+        "models/templates/Qwen-Qwen3-0.6B.jinja",
+        "models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja",
+        "models/templates/ibm-granite-granite-4.1.jinja",
+    };
+
+    for (const auto & path : paths) {
+        auto tmpls = read_templates(path);
+        auto hints = common_chat_templates_render_tool_calls(tmpls.get(), inputs);
+
+        // one call per tool, each naming its tool and none repeating the conversation
+        assert_equals(inputs.tools.size(), hints.size());
+        for (size_t i = 0; i < hints.size(); i++) {
+            assert_contains(hints[i], inputs.tools[i].name);
+            assert_not_contains(hints[i], user.content);
+            assert_not_contains(hints[i], inputs.tools[i].description);
+        }
+
+        // the placeholder takes the type the schema declares
+        assert_contains(hints[0], "\"arg1\": 0");
+        assert_contains(hints[1], "\"city\": \"X\"");
+
+        // each call continues the prompt the model generates from: it starts with the generation prompt
+        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+
+        auto inputs_no_gen = inputs;
+        inputs_no_gen.add_generation_prompt = false;
+        auto without = common_chat_templates_apply(tmpls.get(), inputs_no_gen).prompt;
+
+        assert_equals(without, prompt.substr(0, without.size()));
+        auto generation_prompt = prompt.substr(without.size());
+        for (const auto & hint : hints) {
+            assert_equals(generation_prompt, hint.substr(0, generation_prompt.size()));
+        }
+    }
+
+    // no tools, nothing to render
+    inputs.tools.clear();
+    auto tmpls = read_templates(paths[0]);
+    assert_equals((size_t) 0, common_chat_templates_render_tool_calls(tmpls.get(), inputs).size());
+}
+
 static void test_template_output_peg_parsers(bool detailed_debug) {
     LOG_DBG("%s\n", __func__);
 
@@ -7640,6 +7692,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_render_tool_calls();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

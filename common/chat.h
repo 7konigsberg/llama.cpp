@@ -324,6 +324,12 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
 struct common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                       const struct common_chat_templates_inputs & inputs);
 
+// Render one example call per tool in inputs.tools the way the template would format it,
+// i.e. the assistant turn the model is about to produce, with placeholder argument values.
+// The conversation itself is diffed away. Tools the template cannot render a call for are skipped.
+std::vector<std::string> common_chat_templates_render_tool_calls(const struct common_chat_templates *        tmpls,
+                                                                 const struct common_chat_templates_inputs & inputs);
+
 // Format single message, while taking into account the position of that message in chat history
 std::string common_chat_format_single(const struct common_chat_templates * tmpls,
                                       const std::vector<common_chat_msg> & past_msg,
