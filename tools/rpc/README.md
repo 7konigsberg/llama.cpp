@@ -111,6 +111,21 @@ To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
 $ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
 ```
 
+### Links between servers
+
+When a model is split across several RPC servers, a tensor that one server passes to the next goes over a direct link between the two servers, not through the main host.
+
+The main host opens each link on first use. The receiving server listens on the port the main host connects to plus 1000 (`51052` for a server on `50052`), at the address the main host reached it on, and the sending server connects to it there. That port must be free, and the other RPC servers must be allowed to connect to it. A link uses RDMA when both of its servers can, as the main connection does. `GGML_RPC_NO_RDMA` set on a server keeps that server's links on TCP too; set on the main host, it changes only the main connections.
+
+Each address given to `--rpc` must also reach that server from the other servers. With servers behind tunnels or port mappings, or given as `127.0.0.1` while other servers run on other hosts, set `GGML_RPC_NO_LINK` on the main host. If a link cannot open, the first copy in that direction waits up to 10 seconds, and the copies in that direction then go through the main host.
+
+Links use TCP keepalive. If a link peer's host stops answering, after a power or network loss, a server waiting for data from it gives up after about 150 seconds and then serves its next client. A server sending to it gives up when TCP does, which takes at least 15 minutes with Linux defaults. An idle link also closes after about 150 seconds without network, and the main host then fails at its next copy over that link.
+
+To send all copies through the main host, set `GGML_RPC_NO_LINK` on the main host:
+```bash
+$ GGML_RPC_NO_LINK=1 llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,192.168.88.11:50052
+```
+
 ### Troubleshooting
 
 The `GGML_RPC_DEBUG` environment variable controls the verbosity of the logs emitted by the RPC backend.

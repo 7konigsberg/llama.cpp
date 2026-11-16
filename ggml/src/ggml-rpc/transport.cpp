@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -16,7 +17,11 @@
 #  include <netinet/tcp.h>
 #  include <netdb.h>
 #  include <unistd.h>
+#  include <fcntl.h>
+#  include <poll.h>
 #endif
+#include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -25,12 +30,7 @@
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <array>
-#  include <cerrno>
-#  include <chrono>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
 #  endif
@@ -129,11 +129,28 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
+// Windows' POLLIN also includes POLLRDBAND, which an urgent byte sets while recv() still blocks
+#ifdef _WIN32
+static constexpr short POLL_READABLE = POLLRDNORM;
+#else
+static constexpr short POLL_READABLE = POLLIN;
+#endif
+
+static int poll_socket(sockfd_t sockfd, short events, int timeout_ms) {
+#ifdef _WIN32
+    WSAPOLLFD pfd = { sockfd, events, 0 };
+    return WSAPoll(&pfd, 1, timeout_ms);
+#else
+    pollfd pfd = { sockfd, events, 0 };
+    return poll(&pfd, 1, timeout_ms);
+#endif
+}
+
 struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
-    bool recv_data(void * data, size_t size);
+    bool recv_data(void * data, size_t size, int timeout_ms);
     bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
@@ -571,7 +588,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
-bool socket_t::impl::recv_data(void * data, size_t size) {
+bool socket_t::impl::recv_data(void * data, size_t size, int timeout_ms) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
@@ -582,8 +599,20 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         return rdma_recv(data, size);
     }
 #endif
+    std::chrono::steady_clock::time_point deadline;
+    if (timeout_ms >= 0) {
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    }
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
+        if (timeout_ms >= 0) {
+            const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            const int ready = poll_socket(fd, POLL_READABLE, (int) std::max<int64_t>(left, 0));
+            if (ready <= 0) {
+                LOG_ERROR("%s (bytes_recv=%zu, size=%zu)\n", ready == 0 ? "recv timed out" : "poll failed", bytes_recv, size);
+                return false;
+            }
+        }
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
@@ -682,8 +711,8 @@ bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
 }
 
-bool socket_t::recv_data(void * data, size_t size) {
-    return pimpl->recv_data(data, size);
+bool socket_t::recv_data(void * data, size_t size, int timeout_ms) {
+    return pimpl->recv_data(data, size, timeout_ms);
 }
 
 bool socket_t::flush() {
@@ -723,17 +752,97 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-socket_ptr socket_t::accept() {
+static bool set_nonblocking(sockfd_t sockfd, bool nonblocking) {
+#ifdef _WIN32
+    u_long flag = nonblocking ? 1 : 0;
+    return ioctlsocket(sockfd, FIONBIO, &flag) == 0;
+#else
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    return flags >= 0 && fcntl(sockfd, F_SETFL, nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) == 0;
+#endif
+}
+
+static bool connect_with_timeout(sockfd_t sockfd, const sockaddr_in & addr, int timeout_ms) {
+    if (!set_nonblocking(sockfd, true)) {
+        return false;
+    }
+    if (::connect(sockfd, (const sockaddr *) &addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+        const bool in_progress = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        const bool in_progress = errno == EINPROGRESS;
+#endif
+        if (!in_progress || poll_socket(sockfd, POLLOUT, timeout_ms) <= 0) {
+            return false;
+        }
+        int error = 0;
+        socklen_t error_len = sizeof(error);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char *) &error, &error_len) != 0 || error != 0) {
+            return false;
+        }
+    }
+    return set_nonblocking(sockfd, false);
+}
+
+static bool socket_endpoint(sockfd_t sockfd, bool remote, std::string & host, int & port) {
+    sockaddr_in addr = {};
+    socklen_t addr_len = sizeof(addr);
+    const int ret = remote ? getpeername(sockfd, (sockaddr *) &addr, &addr_len) : getsockname(sockfd, (sockaddr *) &addr, &addr_len);
+    if (ret != 0 || addr.sin_family != AF_INET) {
+        return false;
+    }
+    char buf[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)) == nullptr) {
+        return false;
+    }
+    host = buf;
+    port = ntohs(addr.sin_port);
+    return true;
+}
+
+bool socket_t::local_endpoint(std::string & host, int & port) const {
+    return socket_endpoint(pimpl->fd, false, host, port);
+}
+
+bool socket_t::remote_endpoint(std::string & host, int & port) const {
+    return socket_endpoint(pimpl->fd, true, host, port);
+}
+
+bool socket_t::set_keepalive() {
+#if (defined(TCP_KEEPIDLE) || defined(TCP_KEEPALIVE)) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+#  ifdef TCP_KEEPIDLE
+    const int idle_option = TCP_KEEPIDLE;
+#  else
+    const int idle_option = TCP_KEEPALIVE;
+#  endif
+    int on = 1;
+    int idle = 15;
+    int interval = 15;
+    int count = 9;
+    return setsockopt(pimpl->fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on)) == 0 &&
+           setsockopt(pimpl->fd, IPPROTO_TCP, idle_option, (char *) &idle, sizeof(idle)) == 0 &&
+           setsockopt(pimpl->fd, IPPROTO_TCP, TCP_KEEPINTVL, (char *) &interval, sizeof(interval)) == 0 &&
+           setsockopt(pimpl->fd, IPPROTO_TCP, TCP_KEEPCNT, (char *) &count, sizeof(count)) == 0;
+#else
+    return false;
+#endif
+}
+
+socket_ptr socket_t::accept(int timeout_ms) {
+    if (timeout_ms >= 0 && poll_socket(pimpl->fd, POLL_READABLE, timeout_ms) <= 0) {
+        return nullptr;
+    }
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
     }
+    socket_ptr sock(new socket_t(std::make_unique<impl>(client_socket_fd)));
     if (!set_no_delay(client_socket_fd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
     LOG_DBG("[%s] accepted client connection\n", __func__);
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    return sock;
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -741,6 +850,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
     if (!set_reuse_addr(sockfd)) {
         LOG_ERROR("Failed to set SO_REUSEADDR\n");
         return nullptr;
@@ -761,14 +871,15 @@ socket_ptr socket_t::create_server(const char * host, int port) {
         return nullptr;
     }
     LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return sock;
 }
 
-socket_ptr socket_t::connect(const char * host, int port) {
+socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
     if (!set_no_delay(sockfd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
@@ -782,11 +893,15 @@ socket_ptr socket_t::connect(const char * host, int port) {
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (timeout_ms < 0) {
+        if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            return nullptr;
+        }
+    } else if (!connect_with_timeout(sockfd, addr, timeout_ms)) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return sock;
 }
 
 #ifdef _WIN32
